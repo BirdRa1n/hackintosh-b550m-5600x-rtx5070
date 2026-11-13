@@ -1,0 +1,74 @@
+From: Dário Jr
+Subject: [PATCH] NVRMFB: publish HiDPI modes on cards with a large BAR1
+
+Base: nullmoth/nvidia-macos-driver @ 7412cdd (release 2.9)
+Applies to: kexts/NVRMFB/fb/nvrm-fb.cpp
+
+1. Intercept every write of IOFBMemorySize. getVRAMRange() returns the whole
+   BAR1 (8 GB with Resizable BAR on an RTX 5070); a later 32-bit write of that
+   length truncates to 0. Zero, or anything above the cap, is published as
+   just under 2 GB, which reads the same as a signed/unsigned 32-bit or a
+   64-bit number. Each write is logged (first 8).
+
+2. Report the whole scanout allocation as the system aperture instead of the
+   current mode's surface only. nvfbhidpi=1 already sizes that allocation for
+   a desktop twice the panel; the aperture still covers only memory this
+   framebuffer owns.
+
+Tested on: ASRock B550M, Ryzen 5 5600X, RTX 5070 12 GB (GB205), 3440x1440
+165 Hz display, macOS 26.7.3, NullMoth driver 2.9, boot-arg nvfbhidpi=1, plus
+the display override in ../hidpi. The two changes were tested together; it
+was not isolated whether the override alone would have been enough.
+
+Required Notice: Copyright (c) 2026 NullMoth Systems (https://nullmothsystems.com)
+License: PolyForm Noncommercial 1.0.0 (see LICENSE in this folder)
+
+---
+diff --git a/kexts/NVRMFB/fb/nvrm-fb.cpp b/kexts/NVRMFB/fb/nvrm-fb.cpp
+index e900e42..44970b8 100644
+--- a/kexts/NVRMFB/fb/nvrm-fb.cpp
++++ b/kexts/NVRMFB/fb/nvrm-fb.cpp
+@@ -735,8 +735,31 @@ public:
+             if (t != fTransform) { fTransform = t; fNDT = 0; }
+             publishRotatedSizes();
+         }
++        if (key && key->isEqualTo(kIOFBMemorySizeKey)) {
++            if (OSNumber *n = OSDynamicCast(OSNumber, value)) {
++                const unsigned long long v = n->unsigned64BitValue(), fixed = memorySizeFor(v);
++                if (fMemSizeLogged < 8) { fMemSizeLogged++;
++                    FBLOG("fb%u: IOFBMemorySize write %llu (%u bits) -> %llu", fIndex, v, (unsigned)n->numberOfBits(), fixed); }
++                if (fixed != v) {
++                    OSNumber *f = OSNumber::withNumber(fixed, 32);
++                    if (f) { const bool r = IOFramebuffer::setProperty(key, f); f->release(); return r; }
++                }
++            }
++        }
+         return IOFramebuffer::setProperty(key, value);
+     }
++    // IOFBMemorySize as WindowServer reads it. The BAR1 this framebuffer reports as VRAM is 4 GB or more with Resizable
++    // BAR (8 GB on an RTX 5070), and a write of that length as a 32-bit number keeps only the low bits: 0. With 0 there,
++    // WindowServer dropped every mode whose desktop is larger than the boot surface, so HiDPI "looks like" sizes that
++    // were validated and installed here never reached the mode list. A zero or larger-than-cap size is published as
++    // just under 2 GB, which reads the same as a signed or unsigned 32-bit or a 64-bit number and is still far more than
++    // the largest scanout surface (7680x4320 at 4 bytes is 127 MB).
++    uint32_t fMemSizeLogged = 0;
++    static unsigned long long memorySizeFor(unsigned long long v)
++    {
++        static const unsigned long long kCap = 2047ull << 20;
++        return (!v || v > kCap) ? kCap : v;
++    }
+     void free() override;
+     IOReturn enableController() override;
+     const char *getPixelFormats() override { return kPixelFormats; }
+@@ -5031,6 +5054,11 @@ IODeviceMemory *NVRMNVDAFramebuffer::getApertureRange(IOPixelAperture aperture)
+     const NvU64 owned = fConsoleAperture ? fConsSize : fMemBytes;
+     IOByteCount bytes = (IOByteCount)nvrmApertureBytes(fPitch, fH, owned);
+     if (!bytes) return NULL;
++    // The whole scanout allocation, not only the current mode's surface: nvfbhidpi sizes it for a desktop twice the
++    // panel, and WindowServer leaves out every mode whose surface does not fit the aperture, so with the boot surface
++    // alone (19.9 MB at 3440x1440) every HiDPI desktop (6880x2880 is 79 MB) was validated and installed here but never
++    // listed. The allocation is this framebuffer's own memory, so the aperture still covers nothing else.
++    if (!fConsoleAperture && owned > bytes) bytes = (IOByteCount)owned;
+     IOService *nub = pciNub();
+     if (nub) {
+         IOItemCount n = nub->getDeviceMemoryCount();
