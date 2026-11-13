@@ -1,0 +1,5 @@
+# build output and local backups from driver-patch/
+driver-patch/build/
+driver-patch/backup-installed/
+driver-patch/kmutil.log
+.DS_Store
